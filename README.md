@@ -71,6 +71,9 @@ curl -s -X PUT localhost:9003/chaos -d '{}'                                    #
 go test -race ./...
 ```
 
+CI runs gofmt, `go vet`, staticcheck, govulncheck and the race-enabled tests on every push. The
+end-to-end tests cover about 85% of the statements in `internal/`.
+
 | Rule (brief §2) | How it holds | Test |
 |---|---|---|
 | Target and stoploss never both execute | An exit is chosen only in `OPEN`; choosing one moves the strategy to `EXIT_PENDING`, where no exit is evaluated. Independently, the RMS refuses a second exit while one is working, and sizes every exit to exactly the open position | `TestTargetAndStoplossAreMutuallyExclusive`, `TestRejectedExitReArmsAndOnlyOneLegExecutes`, `TestOnlyOneExitPerStrategy`, `TestGapThroughTargetThenStopExitsOnce` |

@@ -1,5 +1,7 @@
 module github.com/Shravan-Amberkar/stocky
 
-go 1.26.4
+go 1.26
 
-require github.com/coder/websocket v1.8.14 // indirect
+toolchain go1.26.10
+
+require github.com/coder/websocket v1.8.14

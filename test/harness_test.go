@@ -25,12 +25,21 @@ import (
 type recorder struct {
 	mu     sync.Mutex
 	events map[string][]engine.Event
+	fanout engine.Publisher // optional: also forward (the WebSocket hub, in API tests)
 }
 
 func (r *recorder) Publish(user string, e engine.Event) {
 	r.mu.Lock()
 	r.events[user] = append(r.events[user], e)
+	f := r.fanout
 	r.mu.Unlock()
+	if f != nil {
+		f.Publish(user, e)
+	}
+}
+
+func strategySpec(user string) strategy.Spec {
+	return strategy.Spec{User: user, Symbol: "AAA", Side: strategy.Long, Entry: strategy.Market, Trigger: 10_000, Qty: 2}
 }
 
 type system struct {
