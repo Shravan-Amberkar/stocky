@@ -21,6 +21,14 @@ Go 1.26, standard library plus one dependency (`github.com/coder/websocket`). Ev
 
 ## Run
 
+**Guided demo** (needs `curl` and `jq`): `./scripts/demo.sh` builds both binaries, starts them, and
+walks through every rule with real HTTP calls, real TCP and a live WebSocket stream: a gap entry,
+target vs stoploss under duplicated and delayed messages, an RMS margin refusal, a fill lost in a
+disconnect and recovered, a slow symbol, cancel-with-square-off, and a final reconciliation against
+the exchange's fill log.
+
+Or by hand:
+
 ```sh
 go run ./cmd/exchange                      # orders :9001, market data :9002, admin :9003
 go run ./cmd/stocky                        # API + WebSocket :8080; users u1/u2/u3 with fixed margin
