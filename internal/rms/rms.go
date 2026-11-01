@@ -93,17 +93,33 @@ type ord struct {
 	state     orderState
 	remaining int64
 	execs     map[string]bool
+	// A cancel confirmation can overtake fills that happened before it. CANCELLED carries the
+	// exchange's cumulative filled quantity; until fills adding up to it have arrived, the order
+	// stays open to them and is not reported as finished.
+	closing   bool
+	closeKind Kind
+	closeCum  int64
+	reason    string
 }
+
+func (o *ord) filled() int64 { return o.o.Qty - o.remaining }
 
 func (o *ord) live() bool { return o.state == sent || o.state == acked }
 
+// settled reports whether a closing order has now received every fill the exchange reported.
+func (o *ord) settled() bool { return o.closing && o.filled() >= o.closeCum }
+
 type strat struct {
 	entrySide  wire.Side
+	entryLive  bool  // the entry order can still fill
 	entryQty   int64 // filled entry quantity
 	entryValue int64 // margin in use for this strategy's position
+	exitedQty  int64 // filled exit quantity
+	released   int64 // margin already released by exit fills
 	exitLive   bool
-	exitDone   bool
 }
+
+func (s *strat) open() int64 { return s.entryQty - s.exitedQty }
 
 type account struct {
 	limit, used, reserved int64
@@ -198,8 +214,10 @@ func (g *Gateway) Submit(o Order) error {
 			s = &strat{entrySide: o.Side}
 			g.strats[o.StrategyID] = s
 		}
+		s.entryLive = true
 	case Exit:
-		if s == nil || s.entryQty == 0 || s.exitLive || s.exitDone || o.Qty != s.entryQty || o.Side == s.entrySide {
+		// One exit at a time, only once the entry can no longer fill, for exactly the open quantity.
+		if s == nil || s.entryLive || s.exitLive || s.open() <= 0 || o.Qty != s.open() || o.Side == s.entrySide {
 			g.mu.Unlock()
 			return ErrExit
 		}
@@ -241,6 +259,7 @@ func (g *Gateway) onWire(m wire.Msg) {
 		return
 	}
 	a, s := g.accts[o.o.User], g.strats[o.o.StrategyID]
+	var deferred Execution
 	ex := Execution{ClientID: o.o.ClientID, StrategyID: o.o.StrategyID, User: o.o.User, Symbol: o.o.Symbol,
 		Role: o.o.Role, Side: o.o.Side}
 	emit, terminal := false, false
@@ -252,7 +271,8 @@ func (g *Gateway) onWire(m wire.Msg) {
 		}
 		g.t.Acked(o.o.ClientID)
 	case wire.Fill:
-		if o.execs[m.ExecID] || !o.live() || m.Qty <= 0 || m.Qty > o.remaining || m.Price <= 0 {
+		if o.execs[m.ExecID] || !o.live() || m.Qty <= 0 || m.Qty > o.remaining || m.Price <= 0 ||
+			o.closing && o.filled()+m.Qty > o.closeCum {
 			break // duplicate, late or impossible: the books are not touched
 		}
 		if o.o.Role == Entry && (o.o.Side == wire.Buy && m.Price > o.o.Limit || o.o.Side == wire.Sell && m.Price < o.o.Limit) {
@@ -276,28 +296,49 @@ func (g *Gateway) onWire(m wire.Msg) {
 			a.used += use
 			s.entryQty += m.Qty
 			s.entryValue += use
-		} else if o.remaining == 0 {
-			a.used -= s.entryValue
-			s.exitLive, s.exitDone = false, true
+		} else {
+			// Release margin in proportion to the position closed; the last fill releases the rest.
+			s.exitedQty += m.Qty
+			target := s.entryValue * s.exitedQty / s.entryQty
+			if s.exitedQty >= s.entryQty {
+				target = s.entryValue
+			}
+			a.used -= target - s.released
+			s.released = target
+			if o.remaining == 0 {
+				s.exitLive = false
+			}
 		}
 		ex.Kind, ex.Qty, ex.Price, ex.ExecID, emit = Filled, m.Qty, m.Price, m.ExecID, true
 		if o.remaining == 0 {
 			o.state, terminal = filled, true
+			if o.o.Role == Entry {
+				s.entryLive = false
+			}
+		} else if o.settled() {
+			deferred = g.finish(o, s) // the last fill that preceded an earlier-arriving cancel
+			terminal = true
 		}
 	case wire.Reject, wire.Cancelled:
-		if !o.live() {
+		if !o.live() || o.closing {
 			break
 		}
-		if o.o.Role == Entry {
-			a.reserved -= o.remaining * o.o.Limit
-		} else {
-			s.exitLive = false
-		}
-		o.state, ex.Kind = rejected, Rejected
+		kind := Rejected
 		if m.Type == wire.Cancelled {
-			o.state, ex.Kind = cancelled, Cancelled
+			kind = Cancelled
 		}
-		ex.Reason, emit, terminal = m.Reason, true, true
+		cum := m.CumQty
+		if cum < o.filled() {
+			cum = o.filled()
+		}
+		o.closing, o.closeKind, o.closeCum, o.reason = true, kind, cum, m.Reason
+		if o.o.Role == Entry {
+			a.reserved -= (o.o.Qty - cum) * o.o.Limit // the part that will now never fill
+		}
+		if o.settled() {
+			ex = g.finish(o, s)
+			emit, terminal = true, true
+		}
 	case wire.CancelReject:
 		if o.live() {
 			ex.Kind, ex.Reason, emit = CancelRejected, m.Reason, true
@@ -313,6 +354,25 @@ func (g *Gateway) onWire(m wire.Msg) {
 	if emit {
 		g.deliver(ex)
 	}
+	if deferred.Kind != "" {
+		g.deliver(deferred)
+	}
+}
+
+// finish closes an order whose cancel/reject has arrived and whose prior fills are all in. Caller
+// holds g.mu.
+func (g *Gateway) finish(o *ord, s *strat) Execution {
+	o.state = rejected
+	if o.closeKind == Cancelled {
+		o.state = cancelled
+	}
+	if o.o.Role == Entry {
+		s.entryLive = false
+	} else {
+		s.exitLive = false
+	}
+	return Execution{ClientID: o.o.ClientID, StrategyID: o.o.StrategyID, User: o.o.User, Symbol: o.o.Symbol,
+		Role: o.o.Role, Side: o.o.Side, Kind: o.closeKind, Reason: o.reason}
 }
 
 func (g *Gateway) notify(user string, a *account) {

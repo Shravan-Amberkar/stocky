@@ -183,3 +183,72 @@ func TestShortFilledAboveLimitDoesNotGrowMargin(t *testing.T) {
 		t.Fatalf("%+v", v)
 	}
 }
+
+func TestPartialFillsKeepPositionsAndMarginExact(t *testing.T) {
+	g, _, _ := gateway(1_000_000)
+	exit := func(id string, qty int64) Order {
+		return Order{ClientID: id, StrategyID: "S-A", User: "u1", Symbol: "INFY", Role: Exit, Side: wire.Sell, Type: wire.Market, Qty: qty}
+	}
+	g.Submit(entry("A", 10, 10_000)) //nolint:errcheck
+	g.onWire(wire.Msg{Type: wire.Fill, ClientID: "A", ExecID: "F1", Qty: 4, Price: 10_000})
+	if v, _ := g.Account("u1"); v.Used != 40_000 || v.Reserved != 60_000 || v.Positions["INFY"] != 4 {
+		t.Fatalf("after part fill: %+v", v)
+	}
+	if err := g.Submit(exit("X1", 4)); !errors.Is(err, ErrExit) {
+		t.Fatal("exit must wait until the entry can no longer fill")
+	}
+	g.onWire(wire.Msg{Type: wire.Cancelled, ClientID: "A"}) // remainder cancelled
+	if v, _ := g.Account("u1"); v.Reserved != 0 || v.Used != 40_000 {
+		t.Fatalf("remainder's reservation must be released: %+v", v)
+	}
+	if err := g.Submit(exit("X1", 10)); !errors.Is(err, ErrExit) {
+		t.Fatal("exit larger than the position")
+	}
+	if err := g.Submit(exit("X1", 4)); err != nil {
+		t.Fatal(err)
+	}
+	g.onWire(wire.Msg{Type: wire.Fill, ClientID: "X1", ExecID: "F2", Qty: 1, Price: 11_000})
+	if v, _ := g.Account("u1"); v.Used != 30_000 || v.Positions["INFY"] != 3 {
+		t.Fatalf("a quarter of the margin is released: %+v", v)
+	}
+	g.onWire(wire.Msg{Type: wire.Fill, ClientID: "X1", ExecID: "F3", Qty: 3, Price: 11_000})
+	if v, _ := g.Account("u1"); v.Used != 0 || len(v.Positions) != 0 {
+		t.Fatalf("flat and all margin released: %+v", v)
+	}
+}
+
+// The exchange fills 7 of 11 and then cancels the rest, but the CANCELLED overtakes the FILL on
+// the wire. The fill must still be booked, and the strategy must hear "cancelled" only after it.
+func TestCancelThatOvertakesAFillDoesNotLoseTheFill(t *testing.T) {
+	g, f, got := gateway(1_000_000)
+	g.Submit(entry("A", 11, 10_000)) //nolint:errcheck
+	g.onWire(wire.Msg{Type: wire.Cancelled, ClientID: "A", CumQty: 7})
+	if v, _ := g.Account("u1"); v.Reserved != 70_000 || f.done["A"] || len(*got) != 0 {
+		t.Fatalf("cancel must release only the 4 that never filled and wait for the 7: %+v done=%v", v, f.done["A"])
+	}
+	g.onWire(wire.Msg{Type: wire.Fill, ClientID: "A", ExecID: "F1", Qty: 7, Price: 10_000})
+	v, _ := g.Account("u1")
+	if v.Positions["INFY"] != 7 || v.Used != 70_000 || v.Reserved != 0 || !f.done["A"] {
+		t.Fatalf("late fill lost or margin wrong: %+v", v)
+	}
+	if len(*got) != 2 || (*got)[0].Kind != Filled || (*got)[1].Kind != Cancelled {
+		t.Fatalf("engine must see the fill, then the cancel: %+v", *got)
+	}
+	g.onWire(wire.Msg{Type: wire.Fill, ClientID: "A", ExecID: "F9", Qty: 1, Price: 10_000})
+	if v, _ := g.Account("u1"); v.Positions["INFY"] != 7 {
+		t.Fatal("no fills beyond the exchange's cumulative quantity")
+	}
+}
+
+// A duplicated PARTIAL fill is the case only exec-id de-duplication catches: "can't fill more
+// than remains" would happily book 4 + 4 of a 10-lot.
+func TestDuplicatedPartialFillIsBookedOnce(t *testing.T) {
+	g, _, got := gateway(1_000_000)
+	g.Submit(entry("A", 10, 10_000)) //nolint:errcheck
+	f := wire.Msg{Type: wire.Fill, ClientID: "A", ExecID: "F1", Qty: 4, Price: 10_000}
+	g.onWire(f)
+	g.onWire(f)
+	if v, _ := g.Account("u1"); v.Positions["INFY"] != 4 || len(*got) != 1 {
+		t.Fatalf("duplicate partial fill double-booked: %+v", v)
+	}
+}

@@ -5,6 +5,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 API=${STOCKY_HTTP:-127.0.0.1:8111}
+
+# Refuse to start if another instance is already listening: a demo must never mix with a stale run.
+for addr in "$API" 127.0.0.1:9001 127.0.0.1:9002 127.0.0.1:9003; do
+  if lsof -nP -iTCP:"${addr##*:}" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "port ${addr##*:} is already in use (an earlier run still going?). Stop it first:"
+    echo "  pkill -f bin/stocky; pkill -f bin/exchange"
+    exit 1
+  fi
+done
 mkdir -p bin && go build -o bin/ ./cmd/...
 trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
 bin/exchange -tick "${TICK:-1s}" -gap-prob 0.05 &

@@ -4,6 +4,10 @@
 // it: there is no code path to the exchange that does not go through the RMS, and the compiler
 // enforces that.
 //
+// Sending never blocks the caller: messages go onto an unbounded queue drained by a single writer
+// goroutine, so a symbol actor submitting an order never waits on the socket, and a stalled
+// connection cannot hold up any symbol's processing.
+//
 // Never lose an order: every order is recorded as in flight before it is written, and stays in
 // flight until the RMS reports a terminal outcome. After every reconnect, and whenever an order
 // goes unanswered, it is resent. That is safe because NEW and CANCEL are idempotent by client
@@ -32,26 +36,30 @@ type Client struct {
 	addr     string
 	onMsg    func(wire.Msg) // called for every inbound message, from the reader goroutine; must not block
 	log      *slog.Logger
-	resendAt time.Duration
+	resendAt time.Duration // unanswered NEW/CANCEL is resent after this
+	recheck  time.Duration // an acknowledged but unfinished order is re-queried after this
 
 	mu       sync.Mutex
 	inflight map[string]*entry
 	nextSeq  int64
 	w        *wire.Writer // nil while disconnected
 	conn     net.Conn
+	queue    []wire.Msg // outbound, for the current connection only
+	qsig     chan struct{}
 	stop     chan struct{}
 	stopped  bool
 }
 
 func New(addr string, onMsg func(wire.Msg), log *slog.Logger) *Client {
-	return &Client{addr: addr, onMsg: onMsg, log: log, resendAt: time.Second,
-		inflight: map[string]*entry{}, stop: make(chan struct{})}
+	return &Client{addr: addr, onMsg: onMsg, log: log, resendAt: time.Second, recheck: 5 * time.Second,
+		inflight: map[string]*entry{}, stop: make(chan struct{}), qsig: make(chan struct{}, 1)}
 }
 
 // Start connects and keeps reconnecting until Close.
 func (c *Client) Start() {
 	go c.connectLoop()
 	go c.resendLoop()
+	go c.writeLoop()
 }
 
 func (c *Client) Close() {
@@ -66,16 +74,45 @@ func (c *Client) Close() {
 	c.mu.Unlock()
 }
 
-// Send records a NEW as in flight and writes it if connected. If not connected, the reconnect
-// resend delivers it.
+// Send records a NEW as in flight and queues it. If not connected, the reconnect resend delivers it.
 func (c *Client) Send(m wire.Msg) {
 	c.mu.Lock()
 	c.nextSeq++
 	c.inflight[m.ClientID] = &entry{newMsg: m, lastSent: time.Now(), seq: c.nextSeq}
-	w := c.w
+	c.enqueueLocked(m)
 	c.mu.Unlock()
-	if w != nil {
-		c.write(w, m)
+}
+
+// enqueueLocked queues m for the current connection (dropped if disconnected: in-flight orders
+// are resent on reconnect anyway). Caller holds c.mu.
+func (c *Client) enqueueLocked(ms ...wire.Msg) {
+	if c.w == nil {
+		return
+	}
+	c.queue = append(c.queue, ms...)
+	select {
+	case c.qsig <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Client) writeLoop() {
+	for {
+		select {
+		case <-c.stop:
+			return
+		case <-c.qsig:
+		}
+		c.mu.Lock()
+		q, w := c.queue, c.w
+		c.queue = nil
+		c.mu.Unlock()
+		for _, m := range q {
+			if w == nil || w.Write(m) != nil {
+				c.dropConn(w)
+				break
+			}
+		}
 	}
 }
 
@@ -88,11 +125,10 @@ func (c *Client) Cancel(clientID, symbol string) {
 		e.cancel = &m
 		e.lastSent = time.Now()
 	}
-	w := c.w
-	c.mu.Unlock()
-	if ok && w != nil {
-		c.write(w, m)
+	if ok {
+		c.enqueueLocked(m)
 	}
+	c.mu.Unlock()
 }
 
 // Acked marks an order as having reached the exchange.
@@ -130,42 +166,29 @@ func (c *Client) Connected() bool {
 	return c.w != nil
 }
 
-func (c *Client) write(w *wire.Writer, m wire.Msg) {
-	if err := w.Write(m); err != nil {
-		c.dropConn(w)
-	}
-}
-
 func (c *Client) dropConn(w *wire.Writer) {
 	c.mu.Lock()
-	if c.w == w && c.conn != nil {
+	if w != nil && c.w == w && c.conn != nil {
 		c.conn.Close()
 		c.w, c.conn = nil, nil
 	}
 	c.mu.Unlock()
 }
 
-// resendAll replays every in-flight order (and pending cancel) in submission order.
-func (c *Client) resendAll(w *wire.Writer) {
-	type item struct {
-		seq int64
-		msg []wire.Msg
-	}
+// resendAll queues every in-flight order (and pending cancel) in submission order.
+func (c *Client) resendAll() {
 	c.mu.Lock()
-	items := make([]item, 0, len(c.inflight))
+	defer c.mu.Unlock()
+	es := make([]*entry, 0, len(c.inflight))
 	for _, e := range c.inflight {
-		it := item{seq: e.seq, msg: []wire.Msg{e.newMsg}}
-		if e.cancel != nil {
-			it.msg = append(it.msg, *e.cancel)
-		}
-		items = append(items, it)
+		es = append(es, e)
 		e.lastSent = time.Now()
 	}
-	c.mu.Unlock()
-	sort.Slice(items, func(i, j int) bool { return items[i].seq < items[j].seq })
-	for _, it := range items {
-		for _, m := range it.msg {
-			c.write(w, m)
+	sort.Slice(es, func(i, j int) bool { return es[i].seq < es[j].seq })
+	for _, e := range es {
+		c.enqueueLocked(e.newMsg)
+		if e.cancel != nil {
+			c.enqueueLocked(*e.cancel)
 		}
 	}
 }
@@ -196,10 +219,10 @@ func (c *Client) connectLoop() {
 			conn.Close()
 			return
 		}
-		c.conn, c.w = conn, w
+		c.conn, c.w, c.queue = conn, w, nil
 		c.mu.Unlock()
 		c.log.Info("oms: connected", "addr", c.addr)
-		c.resendAll(w)
+		c.resendAll()
 
 		r := wire.NewReader(conn)
 		for {
@@ -226,27 +249,26 @@ func (c *Client) resendLoop() {
 		case <-t.C:
 		}
 		now := time.Now()
-		var due []wire.Msg
 		c.mu.Lock()
-		w := c.w
 		for _, e := range c.inflight {
 			if now.Sub(e.lastSent) < c.resendAt {
 				continue
 			}
-			if !e.acked {
-				due = append(due, e.newMsg)
+			switch {
+			case !e.acked:
+				c.enqueueLocked(e.newMsg)
 				e.lastSent = now
-			} else if e.cancel != nil {
-				due = append(due, *e.cancel)
+			case e.cancel != nil:
+				c.enqueueLocked(*e.cancel)
+				e.lastSent = now
+			case now.Sub(e.lastSent) >= c.recheck:
+				// Acknowledged and still working (e.g. a resting limit). Re-sending the idempotent NEW
+				// makes the exchange replay the order's full state, so a fill lost without a
+				// disconnect is still recovered within one recheck interval.
+				c.enqueueLocked(e.newMsg)
 				e.lastSent = now
 			}
 		}
 		c.mu.Unlock()
-		if w == nil {
-			continue
-		}
-		for _, m := range due {
-			c.write(w, m)
-		}
 	}
 }

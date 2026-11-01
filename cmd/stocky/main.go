@@ -2,12 +2,17 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/Shravan-Amberkar/stocky/internal/api"
 	"github.com/Shravan-Amberkar/stocky/internal/engine"
@@ -43,9 +48,21 @@ func main() {
 	go engine.Feed(*md, eng, log, nil)
 
 	a := &api.API{Engine: eng, Risk: gw, WS: hub, ExchangeAdmin: *admin}
-	log.Info("stocky up", "http", *httpAddr, "exchange", *orders, "md", *md)
-	if err := http.ListenAndServe(*httpAddr, a.Handler()); err != nil {
-		log.Error("http", "err", err)
-		os.Exit(1)
-	}
+	srv := &http.Server{Addr: *httpAddr, Handler: a.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		log.Info("stocky up", "http", *httpAddr, "exchange", *orders, "md", *md)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("http", "err", err)
+			stop()
+		}
+	}()
+	<-ctx.Done()
+	log.Info("shutting down")
+	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv.Shutdown(shutdown) //nolint:errcheck
+	eng.Stop()
+	gw.Close()
 }

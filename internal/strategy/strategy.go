@@ -2,7 +2,7 @@
 // return the orders to place or cancel, and never do I/O. The symbol actor that owns a strategy
 // is the only caller, so no locking is needed and every rule can be unit-tested deterministically.
 //
-//	WAITING_ENTRY --trigger crossed--> ENTRY_PENDING --filled--> OPEN --target|stoploss crossed--> EXIT_PENDING --filled--> CLOSED
+//	WAITING_ENTRY --trigger crossed--> ENTRY_PENDING --fully filled--> OPEN --target|stoploss crossed--> EXIT_PENDING --filled--> CLOSED
 //	      | cancel                        | rejected / cancelled            ^                          | exit rejected
 //	      v                               v                                 +--------------------------+ (re-armed; retried next tick)
 //	  CANCELLED                     REJECTED / CANCELLED
@@ -10,6 +10,10 @@
 // Target vs stoploss: an exit is only ever chosen in OPEN, and choosing one moves the strategy to
 // EXIT_PENDING, where no exit condition is evaluated. Only one exit order can be working, and the
 // RMS independently refuses a second exit for the same strategy.
+//
+// Partial fills: the position is whatever has filled. If an exit condition is hit while the entry
+// is only part-filled, the rest of the entry is cancelled first and the exit then covers exactly
+// what filled; an exit that fills in pieces stays EXIT_PENDING until the whole position is out.
 package strategy
 
 import (
@@ -63,6 +67,9 @@ type Spec struct {
 	Qty      int64     `json:"qty"`
 	Target   int64     `json:"target,omitempty"`   // 0 = none
 	Stoploss int64     `json:"stoploss,omitempty"` // 0 = none
+	// ClientRef makes creation idempotent: a retried request with the same user and ref returns
+	// the original strategy instead of creating (and later trading) a duplicate.
+	ClientRef string `json:"client_ref,omitempty"`
 }
 
 type Strategy struct {
@@ -73,10 +80,14 @@ type Strategy struct {
 	TriggerAbove bool   `json:"trigger_above"` // fire when price rises to Trigger (else when it falls to it)
 	EntryOrder   string `json:"entry_order,omitempty"`
 	ExitOrder    string `json:"exit_order,omitempty"`
-	ExitReason   string `json:"exit_reason,omitempty"` // target | stoploss | cancel
-	FilledQty    int64  `json:"filled_qty"`
-	EntryPrice   int64  `json:"entry_price,omitempty"`
-	ExitPrice    int64  `json:"exit_price,omitempty"`
+	ExitReason   string `json:"exit_reason,omitempty"`    // target | stoploss | cancel
+	FilledQty    int64  `json:"filled_qty"`               // entry quantity filled so far = the position
+	ExitedQty    int64  `json:"exited_qty"`               // exit quantity filled so far
+	EntryPrice   int64  `json:"entry_price,omitempty"`    // average
+	ExitPrice    int64  `json:"exit_price,omitempty"`     // average
+	ExitOnSettle string `json:"exit_on_settle,omitempty"` // exit hit while the entry was part-filled
+	entryValue   int64
+	exitValue    int64
 	CancelAsked  bool   `json:"cancel_requested,omitempty"`
 	ExitAttempts int    `json:"exit_attempts,omitempty"`
 	Note         string `json:"note,omitempty"`
@@ -155,6 +166,15 @@ func (s *Strategy) OnTick(px int64) []Intent {
 		if s.TriggerAbove && px >= s.Trigger || !s.TriggerAbove && px <= s.Trigger {
 			return s.placeEntry(px)
 		}
+	case EntryPending:
+		// Part-filled entry and the market hits an exit level: protect what is held. Cancel the
+		// rest of the entry; when that is confirmed, exit exactly the filled quantity.
+		if s.FilledQty > 0 && s.ExitOnSettle == "" && s.EntryOrder != "" {
+			if reason := s.exitHit(px); reason != "" {
+				s.ExitOnSettle, s.Note = reason, reason+" hit while entry part-filled; cancelling the rest of the entry"
+				return []Intent{{Cancel: s.EntryOrder}}
+			}
+		}
 	case Open:
 		if reason := s.exitHit(px); reason != "" {
 			return s.placeExit(reason)
@@ -200,7 +220,20 @@ func (s *Strategy) placeEntry(px int64) []Intent {
 func (s *Strategy) placeExit(reason string) []Intent {
 	s.State, s.ExitReason = ExitPending, reason
 	s.ExitAttempts++
-	return []Intent{{Place: &Place{Side: s.exitSide(), Type: wire.Market, Qty: s.FilledQty, Why: reason}}}
+	return []Intent{{Place: &Place{Side: s.exitSide(), Type: wire.Market, Qty: s.FilledQty - s.ExitedQty, Why: reason}}}
+}
+
+// entrySettled: the entry order is finished (fully filled, or its remainder cancelled) with a
+// position. Exits are now armed; a pending exit or square-off goes out at once.
+func (s *Strategy) entrySettled() []Intent {
+	s.State = Open
+	switch {
+	case s.ExitOnSettle != "":
+		return s.placeExit(s.ExitOnSettle)
+	case s.CancelAsked:
+		return s.placeExit("cancel") // the fill won the race with the user's cancel: square off
+	}
+	return nil
 }
 
 // OrderPlaced records the client order id the actor assigned to the order just placed.
@@ -233,25 +266,31 @@ func (s *Strategy) OnExecution(clientID, kind string, qty, px int64, reason stri
 	switch kind {
 	case "FILLED":
 		if entry {
-			if s.State != EntryPending {
+			if s.State != EntryPending || qty <= 0 {
 				return nil
 			}
 			s.FilledQty += qty
-			s.EntryPrice = px
+			s.entryValue += qty * px
+			s.EntryPrice = s.entryValue / s.FilledQty
 			if s.FilledQty < s.Qty {
-				return nil
+				return nil // part-filled; the rest is still working
 			}
-			s.State = Open
-			if s.CancelAsked {
-				return s.placeExit("cancel") // the fill won the race with the cancel: square off
-			}
-			return nil
+			return s.entrySettled()
 		}
-		if s.State == ExitPending {
-			s.State, s.ExitPrice = Closed, px
+		if s.State == ExitPending && qty > 0 {
+			s.ExitedQty += qty
+			s.exitValue += qty * px
+			s.ExitPrice = s.exitValue / s.ExitedQty
+			if s.ExitedQty >= s.FilledQty {
+				s.State = Closed
+			}
 		}
 	case "REJECTED", "CANCELLED":
-		if entry && s.State == EntryPending && s.FilledQty == 0 {
+		if entry && s.State == EntryPending {
+			if s.FilledQty > 0 { // the rest of a part-filled entry is gone; we hold what filled
+				s.Note = "entry part-filled: holding " + fmt.Sprint(s.FilledQty) + " of " + fmt.Sprint(s.Qty)
+				return s.entrySettled()
+			}
 			s.State, s.Note = Rejected, "entry "+kind+": "+reason
 			if kind == "CANCELLED" {
 				s.State, s.Note = Cancelled, "cancelled by user"

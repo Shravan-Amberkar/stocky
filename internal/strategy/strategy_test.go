@@ -181,3 +181,87 @@ func TestDeniedExitIsNotStranded(t *testing.T) {
 		t.Fatal("next tick should retry the exit")
 	}
 }
+
+func TestPartialEntryThenFullFill(t *testing.T) {
+	s := longWithExits(t)
+	s.OnTick(10_000)
+	s.OrderPlaced("E1", true)
+	s.OnExecution("E1", "FILLED", 2, 10_000, "")
+	if s.State != EntryPending || s.FilledQty != 2 {
+		t.Fatal("part-filled entry stays pending")
+	}
+	s.OnExecution("E1", "FILLED", 3, 10_100, "")
+	if s.State != Open || s.FilledQty != 5 || s.EntryPrice != 10_060 {
+		t.Fatalf("state=%s filled=%d avg=%d", s.State, s.FilledQty, s.EntryPrice)
+	}
+}
+
+// Stoploss is hit while only part of the entry has filled: cancel the rest, then exit exactly
+// what filled. The position is never left unprotected and never over-exited.
+func TestExitHitWhilePartFilledCancelsRemainderThenExitsFilledQty(t *testing.T) {
+	s := longWithExits(t)
+	s.OnTick(10_000)
+	s.OrderPlaced("E1", true)
+	s.OnExecution("E1", "FILLED", 2, 10_000, "")
+	in := s.OnTick(7_500) // through the stoploss
+	if len(in) != 1 || in[0].Cancel != "E1" || s.ExitOnSettle != "stoploss" {
+		t.Fatalf("expected cancel of the entry remainder: %+v", in)
+	}
+	if s.OnTick(7_400) != nil {
+		t.Fatal("must not cancel twice")
+	}
+	in = s.OnExecution("E1", "CANCELLED", 0, 0, "")
+	if len(in) != 1 || in[0].Place == nil || in[0].Place.Qty != 2 || s.State != ExitPending || s.ExitReason != "stoploss" {
+		t.Fatalf("exit must cover exactly the 2 filled: %+v state=%s", in, s.State)
+	}
+}
+
+// The remainder fills before the cancel lands: exit the whole quantity.
+func TestExitHitWhilePartFilledButRemainderFillsFirst(t *testing.T) {
+	s := longWithExits(t)
+	s.OnTick(10_000)
+	s.OrderPlaced("E1", true)
+	s.OnExecution("E1", "FILLED", 2, 10_000, "")
+	s.OnTick(12_500) // target
+	in := s.OnExecution("E1", "FILLED", 3, 10_000, "")
+	if len(in) != 1 || in[0].Place.Qty != 5 || s.ExitReason != "target" {
+		t.Fatalf("%+v", in)
+	}
+	s.OrderPlaced("X2", false)
+	if s.OnExecution("E1", "CANCEL_REJECTED", 0, 0, "already filled") != nil || s.State != ExitPending {
+		t.Fatal("late cancel-reject must not disturb the exit")
+	}
+}
+
+func TestPartialExit(t *testing.T) {
+	s := longWithExits(t)
+	open(t, s, 10_000)
+	s.OnTick(12_500)
+	s.OrderPlaced("X2", false)
+	s.OnExecution("X2", "FILLED", 3, 12_500, "")
+	if s.State != ExitPending || s.ExitedQty != 3 {
+		t.Fatal("part-filled exit stays pending")
+	}
+	if s.OnTick(5_000) != nil {
+		t.Fatal("no second exit while the first is still filling")
+	}
+	s.OnExecution("X2", "FILLED", 2, 12_400, "")
+	if s.State != Closed || s.ExitPrice != 12_460 {
+		t.Fatalf("state=%s avg=%d", s.State, s.ExitPrice)
+	}
+}
+
+func TestCancelWhilePartFilledSquaresOffWhatFilled(t *testing.T) {
+	s := longWithExits(t)
+	s.OnTick(10_000)
+	s.OrderPlaced("E1", true)
+	s.OnExecution("E1", "FILLED", 1, 10_000, "")
+	in, _ := s.OnCancel()
+	if len(in) != 1 || in[0].Cancel != "E1" {
+		t.Fatal("cancel the entry remainder")
+	}
+	in = s.OnExecution("E1", "CANCELLED", 0, 0, "")
+	if len(in) != 1 || in[0].Place.Qty != 1 || s.ExitReason != "cancel" {
+		t.Fatalf("square off the 1 that filled: %+v", in)
+	}
+}

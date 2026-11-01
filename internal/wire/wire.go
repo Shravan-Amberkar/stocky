@@ -49,6 +49,7 @@ type Msg struct {
 	Qty      int64   `json:"qty,omitempty"`
 	Price    int64   `json:"price,omitempty"` // limit price on NEW, fill price on FILL, last price on TICK
 	ExecID   string  `json:"exec_id,omitempty"`
+	CumQty   int64   `json:"cum_qty,omitempty"` // on CANCELLED: total quantity filled before the cancel (as FIX CumQty)
 	Reason   string  `json:"reason,omitempty"`
 }
 

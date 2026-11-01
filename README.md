@@ -1,5 +1,7 @@
 # Stocky — automated entry/exit strategies
 
+![ci](https://github.com/Shravan-Amberkar/stocky/actions/workflows/ci.yml/badge.svg)
+
 A user defines a strategy: symbol, long or short, a market or limit entry fired at a trigger price,
 a quantity, and an optional target and/or stoploss. Stocky watches prices, enters when the trigger
 is crossed, and exits at the target or the stoploss (never both).
@@ -44,7 +46,7 @@ Create, view and cancel a strategy (prices are **paise**, so 160000 = ₹1,600.0
 
 ```sh
 curl -s localhost:8080/strategies -d '{"user":"u1","symbol":"INFY","side":"LONG","entry":"MARKET",
-  "trigger":160500,"qty":10,"target":162000,"stoploss":159000}'
+  "trigger":160500,"qty":10,"target":162000,"stoploss":159000,"client_ref":"my-retry-key-1"}'
 curl -s localhost:8080/strategies?user=u1
 curl -s localhost:8080/strategies/<id>
 curl -s -X DELETE localhost:8080/strategies/<id>
@@ -54,7 +56,7 @@ curl -s localhost:8080/accounts/u1         # margin limit / used / reserved, pos
 Turn exchange misbehaviour on and off while it runs:
 
 ```sh
-curl -s -X PUT localhost:9003/chaos -d '{"drop":0.02,"delay":50000000,"duplicate":0.2,"reorder":0.2,"reject":0.1}'
+curl -s -X PUT localhost:9003/chaos -d '{"drop":0.02,"delay":50000000,"duplicate":0.2,"reorder":0.2,"reject":0.1,"partial":0.5}'
 curl -s -X PUT localhost:9003/chaos -d '{"symbol_delay":{"INFY":3000000000}}'   # one slow symbol
 curl -s -X POST localhost:9003/price -d '{"symbol":"INFY","price":170000}'      # gap the price
 curl -s -X POST localhost:9003/drop                                            # cut the connection now
@@ -71,18 +73,20 @@ go test -race ./...
 
 | Rule (brief §2) | How it holds | Test |
 |---|---|---|
-| Target and stoploss never both execute | An exit is chosen only in `OPEN`; choosing one moves the strategy to `EXIT_PENDING`, where no exit is evaluated. Independently, the RMS refuses a second exit order for a strategy whose exit is working or done | `TestTargetAndStoplossAreMutuallyExclusive`, `TestRejectedExitReArmsAndOnlyOneLegExecutes`, `TestOnlyOneExitPerStrategy`, `TestGapThroughTargetThenStopExitsOnce` |
-| An order is never duplicated or silently lost | Each order has a client id and is recorded as in flight before it is written. It is resent after every reconnect and whenever unanswered. The exchange treats `NEW`/`CANCEL` as idempotent by client id. The RMS drops duplicate executions by exec id | `TestFillLostInDisconnectIsRecovered`, `TestDuplicateLateAndUnknownExecutionsAreDropped`, `TestInvariantsUnderChaos` |
-| Positions always equal what the exchange filled | Positions change only on validated fills, in one place (the RMS) | `TestInvariantsUnderChaos`, which compares every user's positions with the exchange's own fill log |
+| Target and stoploss never both execute | An exit is chosen only in `OPEN`; choosing one moves the strategy to `EXIT_PENDING`, where no exit is evaluated. Independently, the RMS refuses a second exit while one is working, and sizes every exit to exactly the open position | `TestTargetAndStoplossAreMutuallyExclusive`, `TestRejectedExitReArmsAndOnlyOneLegExecutes`, `TestOnlyOneExitPerStrategy`, `TestGapThroughTargetThenStopExitsOnce` |
+| An order is never duplicated or silently lost | Each order has a client id and is recorded as in flight before it is written. It is resent after every reconnect and whenever unanswered. The exchange treats `NEW`/`CANCEL` as idempotent by client id. The RMS drops duplicate executions by exec id. Strategy creation is idempotent too: a retried `POST /strategies` with the same `client_ref` returns the original | `TestFillLostInDisconnectIsRecovered`, `TestDuplicateLateAndUnknownExecutionsAreDropped`, `TestRetriedCreateDoesNotDuplicate`, `TestInvariantsUnderChaos` |
+| Positions always equal what the exchange filled | Positions change only on validated fills, in one place (the RMS). A cancel confirmation carries the exchange's cumulative filled quantity (like FIX `CumQty`), so a fill that arrives *after* its own order's cancel is still booked | `TestCancelThatOvertakesAFillDoesNotLoseTheFill`, `TestPartialFillsKeepPositionsAndMarginExact`, and `TestInvariantsUnderChaos`, which compares every user's positions and every strategy's filled quantities with the exchange's own fill log |
 | A user never exceeds margin | Checked and reserved under one lock, so concurrent orders across symbols can't jointly exceed it. Entries always carry a price cap (market entries become protected limits), and margin in use is capped at what was reserved, so a fill through a gap can't grow it | `TestMarginNeverExceededUnderConcurrency`, `TestConcurrentTriggersNeverExceedMargin`, `TestShortFilledAboveLimitDoesNotGrowMargin`, plus a hook asserting the limit after **every** change in every end-to-end test |
-| A slow order on one symbol doesn't hold up others | One actor per symbol with an unbounded mailbox. Nothing upstream (feed, OMS reader) ever waits on an actor | `TestSlowSymbolDoesNotBlockOthers` (3 s delay on one symbol; the other opens in ~12 ms) |
+| A slow order on one symbol doesn't hold up others | One actor per symbol with an unbounded mailbox. Nothing upstream (feed, OMS reader) ever waits on an actor, and actors never touch the socket: orders go onto a queue drained by a single writer | `TestSlowSymbolDoesNotBlockOthers` (3 s delay on one symbol; the other opens in ~12 ms) |
 | No path to the OMS without the RMS | The OMS lives at `internal/rms/internal/oms`. Go's internal-package rule means **only `rms` can import it**, so a bypass does not compile | `TestBypassingTheRMSDoesNotCompile`, `TestOnlyRMSImportsTheOMS` |
 
 `TestInvariantsUnderChaos` is the main proof:
-- every misbehaviour is on at once, plus forced disconnects;
+- every misbehaviour is on at once (drops, delays, duplicates, reordering, rejections, partial fills), plus forced disconnects;
 - 200 strategies across 4 symbols and 3 users trade through 300 gapping ticks, with random cancels;
 - three seeds;
-- afterwards Stocky's books are checked against the exchange's records: every order sent exists on the exchange exactly once, positions equal fills, every strategy's state agrees with its fills, at most one exit filled per strategy, and margin was never exceeded.
+- afterwards Stocky's books are checked against the exchange's records: every order sent exists on the exchange exactly once, positions equal fills, every strategy's filled quantities agree with the exchange, at most one exit filled per strategy and it closed exactly what was entered, and margin was never exceeded.
+
+How I know the tests bite: I deliberately broke duplicate-fill handling in the RMS and re-ran the chaos test, and it failed straight away with margin breaches and wrong positions. Running the suite repeatedly is also how I found, and fixed, a cancel overtaking its own fill on the wire.
 
 ## Design decisions
 
@@ -97,16 +101,16 @@ go test -race ./...
   - With a position open: it is squared off at market.
   - During an exit: refused, because the exit is already flattening the position.
 - **A rejected exit re-arms both legs.** The next tick that meets either condition tries again.
+- **Partial fills.** The position is whatever has filled. If an exit level is hit while the entry is only partly filled, the rest of the entry is cancelled first, and the exit then covers exactly what filled: never an accidental reverse position. Exits that fill in pieces stay working until the position is flat. Margin is released in proportion.
+- **Exits are market orders.** A stoploss has to execute; a protected limit could sit unfilled while the price runs away. The cost is slippage in a gap, which is the normal trade-off for a stop-market.
+- **Margin is notional and checked at order time**, exactly as the brief defines it: each order's value must fit the user's fixed available margin. P&L, mark-to-market and leverage (SPAN) are a different product and out of scope.
 
 ## Known gaps and shortcuts
 
-- **Fills are all-or-nothing.** The mock exchange never partially fills. The code paths accumulate filled quantity, but partial-fill exits are not tested.
-- **Margin is notional and blocked at order time.** There is no mark-to-market, P&L, leverage or exchange-specific margin (SPAN). A short's loss is not charged against margin. Exits are not margin-checked, since they reduce exposure.
-- **Exits are market orders.** A real stoploss would be sent as a stop-limit with its own protection band.
-- **Chaos applies only to the order session.** Market data is a clean stream. A gap in market data would delay triggers but couldn't break a rule, since every decision re-reads the order book.
-- **State is in memory.** If Stocky restarts, strategies are lost. If the exchange restarts, its order book is lost and resends would create fresh orders. Client ids include a per-run prefix so a restarted Stocky never collides with old orders.
-- **One order session, one writer.** A stalled TCP write would delay every symbol's outbound orders, though never their inbound processing.
-- **The mock exchange fills at the current price with unlimited liquidity.** There is no queue position or order book depth.
+- **State is in memory (as the brief allows).** If Stocky restarts, strategies are lost. If the exchange restarts, its order book is lost, and resends would then place fresh orders. Persistence (a journal of orders and fills) is the first thing I'd add for production. Client ids carry a per-run prefix, so a restarted Stocky never collides with old ids.
+- **Chaos applies to the order session, not market data.** A gap in market data would delay triggers but cannot break a rule, because every decision is re-checked against the RMS's books.
+- **The mock exchange's liquidity is idealised.** Fills happen at the current price; partial fills are random. There is no order-book depth or queue position.
 - **The WebSocket is in-process,** behind the `engine.Publisher` interface. In production I'd put a dedicated realtime server there (for example Centrifugo, with user-limited channels, history for reconnecting clients and multi-node fan-out) without touching the engine. Slow WebSocket clients are disconnected rather than allowed to slow trading.
+- **Single node.** One order session to the exchange; scaling out would shard symbols across nodes, with the per-user margin ledger becoming the one shared service.
 - **No authentication;** the user id is taken from the request, as the brief allows. The admin port has no auth either.
-- **Strategy snapshots for the API are copied after each change.** That is fine here; at large scale it would become a read-model projection.
+- **The demo console is a convenience,** not part of the brief: one embedded HTML file over the same API.

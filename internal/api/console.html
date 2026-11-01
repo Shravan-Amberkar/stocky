@@ -54,6 +54,7 @@
     <label><input type="checkbox" data-k="delay" data-v="300000000"> delay messages (up to 300 ms)</label>
     <label><input type="checkbox" data-k="reorder" data-v="0.5"> reorder messages</label>
     <label><input type="checkbox" data-k="reject" data-v="0.3"> reject 30% of orders</label>
+    <label><input type="checkbox" data-k="partial" data-v="0.7"> partial fills (orders fill in pieces)</label>
     <label><input type="checkbox" data-k="drop" data-v="0.05"> drop connection randomly (5%)</label>
     <div style="display:flex;gap:8px;margin-top:8px"><button id="cut">Cut connection now</button><button id="calm">All off</button></div>
     <small>The rules must hold whatever is switched on.</small></section>
@@ -164,7 +165,7 @@ function renderStrats(list) {
     const sp = s.spec, live = !["CLOSED","CANCELLED","REJECTED","EXIT_PENDING"].includes(s.state);
     return `<tr><td class="muted">${esc(s.id.split("-").pop())}</td><td>${sp.symbol}</td><td>${sp.side}</td><td class="num">${sp.qty}</td>
       <td class="num">${rs(sp.trigger)}${sp.entry === "LIMIT" ? " / lim " + rs(sp.limit) : ""}</td><td class="num">${rs(sp.target)}</td><td class="num">${rs(sp.stoploss)}</td>
-      <td><span class="badge ${s.state}">${s.state}</span></td><td class="num">${s.entry_price ? rs(s.entry_price) : ""}</td>
+      <td><span class="badge ${s.state}">${s.state}</span></td><td class="num">${s.entry_price ? rs(s.entry_price) + (s.filled_qty < sp.qty ? ` (${s.filled_qty}/${sp.qty})` : "") : ""}</td>
       <td>${s.exit_reason ? esc(s.exit_reason) + " @ " + rs(s.exit_price) : ""}</td><td class="muted">${esc(s.note)}</td>
       <td>${live ? `<button onclick="cancelS('${s.id}')">cancel</button>` : ""}</td></tr>`;
   }).join("") || `<tr><td colspan="12" class="muted">No strategies yet. Create one above.</td></tr>`;
@@ -187,7 +188,8 @@ $("#fill").onclick = () => {
 $("#form").onsubmit = async e => {
   e.preventDefault(); const f = e.target, paise = v => v === "" ? 0 : Math.round(parseFloat(v) * 100);
   const body = {user, symbol: f.symbol.value, side: f.side.value, entry: f.entry.value, qty: parseInt(f.qty.value, 10),
-    trigger: paise(f.trigger.value), target: paise(f.target.value), stoploss: paise(f.stoploss.value)};
+    trigger: paise(f.trigger.value), target: paise(f.target.value), stoploss: paise(f.stoploss.value),
+    client_ref: crypto.randomUUID()};  // a retried request would carry the same ref and not duplicate
   if (f.entry.value === "LIMIT") body.limit = paise(f.limit.value);
   try { await j("/strategies", {method: "POST", body: JSON.stringify(body)}); $("#ferr").textContent = ""; }
   catch (err) { $("#ferr").textContent = err.message; }

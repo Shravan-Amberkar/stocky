@@ -41,6 +41,7 @@ type system struct {
 	pub    *recorder
 	stop   chan struct{}
 	breach atomic.Int64 // margin breaches seen by the RMS hook
+	orders string       // exchange order-port address
 }
 
 func logger() *slog.Logger {
@@ -69,7 +70,7 @@ func start(t *testing.T, prices map[string]int64, limits map[string]int64) *syst
 	for s := range prices {
 		symbols = append(symbols, s)
 	}
-	s := &system{t: t, ex: ex, pub: &recorder{events: map[string][]engine.Event{}}, stop: make(chan struct{})}
+	s := &system{t: t, ex: ex, pub: &recorder{events: map[string][]engine.Event{}}, stop: make(chan struct{}), orders: lo.Addr().String()}
 	s.eng = engine.New(symbols, s.pub, log)
 	s.gw = rms.New(limits, lo.Addr().String(), s.eng.Deliver, log)
 	s.gw.SetHook(func(user string, v rms.AccountView) {
@@ -94,7 +95,7 @@ func start(t *testing.T, prices map[string]int64, limits map[string]int64) *syst
 func (s *system) create(sp strategy.Spec) (strategy.Strategy, error) {
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		st, err := s.eng.Create(sp)
+		st, _, err := s.eng.Create(sp)
 		if !errors.Is(err, strategy.ErrNoPrice) || time.Now().After(deadline) {
 			return st, err
 		}
@@ -192,35 +193,40 @@ func (s *system) checkInvariants() {
 
 	// 1. Target and stoploss never both execute; and each strategy agrees with the exchange.
 	for _, st := range s.eng.List("") {
-		var entries, entryFilled, exitsFilled int
+		var entries, exitsFilled int
+		var entryQty, exitQty int64
 		for id, o := range sent {
 			if o.StrategyID != st.ID {
 				continue
 			}
 			if o.Role == rms.Entry {
 				entries++
+				entryQty += fillQty[id]
+			} else {
+				exitQty += fillQty[id]
 				if fillQty[id] > 0 {
-					entryFilled++
+					exitsFilled++
 				}
-			} else if fillQty[id] > 0 {
-				exitsFilled++
 			}
 		}
-		if entries > 1 || exitsFilled > 1 || exitsFilled > entryFilled {
-			t.Errorf("%s: %d entry orders, %d entries filled, %d exits filled", st.ID, entries, entryFilled, exitsFilled)
+		if entries > 1 || exitsFilled > 1 || exitQty > entryQty {
+			t.Errorf("%s: %d entry orders, %d exits filled, exited %d of %d", st.ID, entries, exitsFilled, exitQty, entryQty)
+		}
+		if st.FilledQty != entryQty || st.ExitedQty != exitQty {
+			t.Errorf("%s: strategy says entry %d / exit %d, exchange says %d / %d", st.ID, st.FilledQty, st.ExitedQty, entryQty, exitQty)
 		}
 		switch st.State {
 		case strategy.Closed:
-			if exitsFilled != 1 {
-				t.Errorf("%s CLOSED but exchange shows %d filled exits", st.ID, exitsFilled)
+			if exitsFilled != 1 || exitQty != entryQty {
+				t.Errorf("%s CLOSED but exchange shows %d filled exits covering %d of %d", st.ID, exitsFilled, exitQty, entryQty)
 			}
 		case strategy.Open:
-			if entryFilled != 1 || exitsFilled != 0 {
-				t.Errorf("%s OPEN but exchange shows entry=%d exits=%d", st.ID, entryFilled, exitsFilled)
+			if entryQty == 0 || exitQty != 0 {
+				t.Errorf("%s OPEN but exchange shows entry=%d exit=%d", st.ID, entryQty, exitQty)
 			}
-		case strategy.WaitingEntry, strategy.Rejected:
-			if entryFilled != 0 {
-				t.Errorf("%s %s but its entry filled on the exchange", st.ID, st.State)
+		case strategy.WaitingEntry, strategy.Rejected, strategy.Cancelled:
+			if entryQty != 0 {
+				t.Errorf("%s %s but %d of its entry filled on the exchange", st.ID, st.State, entryQty)
 			}
 		}
 	}

@@ -52,13 +52,16 @@ type Engine struct {
 	snaps map[string]strategy.Strategy // read model for the API, written by actors
 
 	prices sync.Map // symbol -> last price, for display only
+
+	refMu sync.Mutex
+	refs  map[string]string // user + client_ref -> strategy id
 }
 
 func New(symbols []string, pub Publisher, log *slog.Logger) *Engine {
 	b := make([]byte, 3)
 	rand.Read(b) //nolint:errcheck
 	e := &Engine{log: log, pub: pub, runID: hex.EncodeToString(b), actors: map[string]*actor{},
-		snaps: map[string]strategy.Strategy{}}
+		snaps: map[string]strategy.Strategy{}, refs: map[string]string{}}
 	for _, s := range symbols {
 		e.actors[s] = &actor{e: e, symbol: s, strats: map[string]*strategy.Strategy{}, mb: newMailbox()}
 	}
@@ -135,9 +138,27 @@ func (e *Engine) ask(symbol string, cmd any, ch chan reply) (strategy.Strategy, 
 	}
 }
 
-func (e *Engine) Create(sp strategy.Spec) (strategy.Strategy, error) {
+// Create starts a strategy. With a ClientRef, a repeat of the same request returns the original
+// (created=false) instead of a duplicate.
+func (e *Engine) Create(sp strategy.Spec) (s strategy.Strategy, created bool, err error) {
+	if sp.ClientRef == "" {
+		ch := make(chan reply, 1)
+		s, err = e.ask(sp.Symbol, createCmd{sp, ch}, ch)
+		return s, err == nil, err
+	}
+	key := sp.User + "\x00" + sp.ClientRef
+	e.refMu.Lock()
+	defer e.refMu.Unlock()
+	if id, ok := e.refs[key]; ok {
+		s, _ = e.Get(id)
+		return s, false, nil
+	}
 	ch := make(chan reply, 1)
-	return e.ask(sp.Symbol, createCmd{sp, ch}, ch)
+	if s, err = e.ask(sp.Symbol, createCmd{sp, ch}, ch); err != nil {
+		return s, false, err
+	}
+	e.refs[key] = s.ID
+	return s, true, nil
 }
 
 func (e *Engine) Cancel(id string) (strategy.Strategy, error) {

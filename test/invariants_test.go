@@ -1,12 +1,16 @@
 package test
 
 import (
+	"errors"
 	"math/rand/v2"
+	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Shravan-Amberkar/stocky/internal/exchange"
 	"github.com/Shravan-Amberkar/stocky/internal/strategy"
+	"github.com/Shravan-Amberkar/stocky/internal/wire"
 )
 
 const lvl = 5 // tick size in paise
@@ -14,7 +18,8 @@ const lvl = 5 // tick size in paise
 var prices = map[string]int64{"AAA": 10_000, "BBB": 20_000, "CCC": 5_000, "DDD": 40_000}
 
 // TestInvariantsUnderChaos is the main proof. Every misbehaviour is on at once: connections drop
-// at any point, replies are delayed, duplicated and reordered, and orders are rejected. Hundreds
+// at any point, replies are delayed, duplicated and reordered, orders are rejected, and fills
+// arrive in pieces. Hundreds
 // of strategies across four symbols and three users trade through gapping prices. Afterwards
 // Stocky's books are compared with the exchange's own records.
 func TestInvariantsUnderChaos(t *testing.T) {
@@ -22,7 +27,7 @@ func TestInvariantsUnderChaos(t *testing.T) {
 		t.Run("seed", func(t *testing.T) {
 			rng := rand.New(rand.NewPCG(seed, seed*7))
 			s := start(t, prices, map[string]int64{"u1": 3_000_000, "u2": 1_000_000, "u3": 50_000_000})
-			s.ex.SetChaos(exchange.Chaos{Drop: 0.02, Delay: 20 * time.Millisecond, Duplicate: 0.15, Reorder: 0.15, Reject: 0.1})
+			s.ex.SetChaos(exchange.Chaos{Drop: 0.02, Delay: 20 * time.Millisecond, Duplicate: 0.15, Reorder: 0.15, Reject: 0.1, Partial: 0.4})
 
 			users := []string{"u1", "u2", "u3"}
 			created := 0
@@ -220,4 +225,113 @@ func TestConcurrentTriggersNeverExceedMargin(t *testing.T) {
 		t.Fatalf("open=%d denied=%d", open, denied)
 	}
 	t.Logf("%d entries fit the margin, %d were refused by the RMS", open, denied)
+}
+
+// The stoploss is hit while only part of the entry has filled. Whether the rest of the entry is
+// cancelled first or fills before the cancel lands (both happen in practice), Stocky must exit
+// exactly what filled: never more (an accidental short) and never less. The cancel path itself
+// is pinned deterministically in the strategy unit tests.
+func TestStoplossDuringPartialEntryExitsExactlyWhatFilled(t *testing.T) {
+	for range 5 {
+		s := start(t, map[string]int64{"AAA": 10_000}, map[string]int64{"u1": 10_000_000})
+		s.ex.SetChaos(exchange.Chaos{Partial: 1})
+		st, err := s.create(strategy.Spec{User: "u1", Symbol: "AAA", Side: strategy.Long, Entry: strategy.Market, Trigger: 10_000,
+			Qty: 50, Target: 11_000, Stoploss: 9_000})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.waitFor("part fill", 2*time.Second, func() bool { x, _ := s.eng.Get(st.ID); return x.FilledQty > 0 })
+		part, _ := s.eng.Get(st.ID)
+		if part.FilledQty >= 50 || part.State != strategy.EntryPending {
+			t.Fatalf("expected a part-filled entry, got %d filled, %s", part.FilledQty, part.State)
+		}
+		s.ex.SetPrice("AAA", 8_500) // through the stop (the entry remainder may part-fill again here)
+		s.ex.SetChaos(exchange.Chaos{})
+		s.ex.SetPrice("AAA", 8_400)
+		s.settle(5 * time.Second)
+		s.checkInvariants()
+		x, _ := s.eng.Get(st.ID)
+		if x.State != strategy.Closed || x.ExitReason != "stoploss" || x.ExitedQty != x.FilledQty {
+			t.Fatalf("state=%s reason=%s filled=%d exited=%d", x.State, x.ExitReason, x.FilledQty, x.ExitedQty)
+		}
+		if a, _ := s.gw.Account("u1"); len(a.Positions) != 0 || a.Used != 0 || a.Reserved != 0 {
+			t.Fatalf("expected flat with all margin released: %+v", a)
+		}
+		t.Logf("part-filled %d of 50 when the stop hit; final entry %d, exited exactly %d", part.FilledQty, x.FilledQty, x.ExitedQty)
+	}
+}
+
+// A client retries POST /strategies after a timeout. With a client_ref the retry must return the
+// original strategy, not create a second one that would place a second order.
+func TestRetriedCreateDoesNotDuplicate(t *testing.T) {
+	s := start(t, map[string]int64{"AAA": 10_000}, map[string]int64{"u1": 10_000_000})
+	sp := strategy.Spec{User: "u1", Symbol: "AAA", Side: strategy.Long, Entry: strategy.Market, Trigger: 10_000, Qty: 3, ClientRef: "order-form-42"}
+	var ids = map[string]bool{}
+	var created int
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.waitFor("price", 3*time.Second, func() bool { return s.ex.Price("AAA") > 0 })
+			st, c, err := s.eng.Create(sp)
+			for errors.Is(err, strategy.ErrNoPrice) {
+				time.Sleep(10 * time.Millisecond)
+				st, c, err = s.eng.Create(sp)
+			}
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			ids[st.ID] = true
+			if c {
+				created++
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	s.settle(5 * time.Second)
+	s.checkInvariants()
+	if len(ids) != 1 || created != 1 || len(s.ex.Orders()) != 1 {
+		t.Fatalf("strategies=%d created=%d exchange orders=%d", len(ids), created, len(s.ex.Orders()))
+	}
+}
+
+// A fill is delivered somewhere else (here: another session re-sends the order, so the exchange
+// routes the fill to it) and Stocky's own connection never drops. The periodic status recheck must
+// still recover it, so positions match the exchange.
+func TestFillLostWithoutDisconnectIsRecoveredByRecheck(t *testing.T) {
+	s := start(t, map[string]int64{"AAA": 10_000}, map[string]int64{"u1": 10_000_000})
+	st, err := s.create(strategy.Spec{User: "u1", Symbol: "AAA", Side: strategy.Long, Entry: strategy.Limit,
+		Trigger: 10_000, Limit: 9_000, Qty: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.waitFor("entry resting at the exchange", 2*time.Second, func() bool { return len(s.ex.Orders()) == 1 && s.gw.Unconfirmed() == 0 })
+	var id string
+	for k := range s.ex.Orders() {
+		id = k
+	}
+	rogue, err := net.Dial("tcp", s.orders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rogue.Close()
+	o := s.gw.SentOrders()[id]
+	wire.NewWriter(rogue).Write(wire.Msg{Type: wire.New, ClientID: id, User: o.User, Symbol: o.Symbol, Side: o.Side, //nolint:errcheck
+		OrdType: o.Type, Qty: o.Qty, Price: o.Limit})
+	time.Sleep(100 * time.Millisecond)
+	s.ex.SetPrice("AAA", 8_900) // the limit fills; the FILL goes to the rogue session, not Stocky
+	time.Sleep(200 * time.Millisecond)
+	if x, _ := s.eng.Get(st.ID); x.FilledQty != 0 {
+		t.Fatal("test setup: Stocky should not have seen the fill yet")
+	}
+	t0 := time.Now()
+	s.waitFor("recheck to recover the fill", 10*time.Second, func() bool { x, _ := s.eng.Get(st.ID); return x.State == strategy.Open })
+	s.settle(3 * time.Second)
+	s.checkInvariants()
+	t.Logf("lost fill recovered by status recheck after %v", time.Since(t0).Round(100*time.Millisecond))
 }

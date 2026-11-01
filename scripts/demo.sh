@@ -8,6 +8,15 @@ cd "$(dirname "$0")/.."
 API=${STOCKY_HTTP:-127.0.0.1:8111}
 ADMIN=127.0.0.1:9003
 LOGS=$(mktemp -d)
+
+# Refuse to start if another instance is already listening: a demo must never mix with a stale run.
+for addr in "$API" 127.0.0.1:9001 127.0.0.1:9002 127.0.0.1:9003; do
+  if lsof -nP -iTCP:"${addr##*:}" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "port ${addr##*:} is already in use (an earlier run still going?). Stop it first:"
+    echo "  pkill -f bin/stocky; pkill -f bin/exchange"
+    exit 1
+  fi
+done
 trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
 
 say()  { printf '\n\033[1;34m== %s\033[0m\n' "$*"; }
@@ -85,10 +94,25 @@ say "6. Cancel with an open position squares it off (no orphaned position)"
 curl -s -X DELETE "$API/strategies/$E" >/dev/null; sleep 0.4
 show "$E"
 
-say "7. Reconciliation: Stocky's positions vs the exchange's own fill log"
+say "7. Partial fills: the stoploss is hit while only part of the entry has filled"
+chaos '{"partial":1}'
+F=$(create '{"user":"u1","symbol":"RELIANCE","side":"LONG","entry":"MARKET","trigger":290000,"qty":20,"target":300000,"stoploss":285000}' | jq -r .id)
+sleep 0.3
+curl -s "$API/strategies/$F" | jq -r '"   \(.id)  filled \(.filled_qty) of \(.spec.qty) so far, state=\(.state)"'
+chaos '{}'
+price RELIANCE 284000; sleep 0.5
+show "$F"
+curl -s "$API/strategies/$F" | jq -r '"   entered \(.filled_qty), exited \(.exited_qty): the exit covered exactly what was held"'
+
+say "8. Retrying a create with the same client_ref returns the same strategy (no duplicate order)"
+R1=$(create '{"user":"u1","symbol":"TCS","side":"LONG","entry":"MARKET","trigger":420000,"qty":1,"client_ref":"form-123"}' | jq -r .id)
+R2=$(create '{"user":"u1","symbol":"TCS","side":"LONG","entry":"MARKET","trigger":420000,"qty":1,"client_ref":"form-123"}' | jq -r .id)
+note "first: $R1   retry: $R2"
+
+say "9. Reconciliation: Stocky's positions vs the exchange's own fill log"
 account u1
 curl -s "$ADMIN/fills" | jq -r 'group_by(.Symbol)[] | "   exchange \(.[0].Symbol): net \( map(if .Side=="BUY" then .Qty else -.Qty end) | add )"'
 
-say "8. u1's WebSocket stream ($(wc -l <"$LOGS/u1-stream.jsonl" | tr -d ' ') events); the last few:"
+say "10. u1's WebSocket stream ($(wc -l <"$LOGS/u1-stream.jsonl" | tr -d ' ') events); the last few:"
 tail -4 "$LOGS/u1-stream.jsonl" | jq -c '{type, id:(.strategy.id // .order.client_id), state:(.strategy.state // .order.kind)}' | sed 's/^/   /'
 echo; note "logs: $LOGS"

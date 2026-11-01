@@ -77,9 +77,13 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 		write(w, http.StatusBadRequest, map[string]string{"error": "unknown user"})
 		return
 	}
-	s, err := a.Engine.Create(sp)
+	s, created, err := a.Engine.Create(sp)
 	if err != nil {
 		fail(w, err)
+		return
+	}
+	if !created {
+		write(w, http.StatusOK, s) // a retry of a request already applied
 		return
 	}
 	write(w, http.StatusCreated, s)

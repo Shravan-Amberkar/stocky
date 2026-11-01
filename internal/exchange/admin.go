@@ -8,7 +8,7 @@ import (
 // AdminHandler exposes runtime toggles:
 //
 //	GET  /chaos            current toggles
-//	PUT  /chaos            replace toggles, e.g. {"drop":0.02,"delay":50000000,"duplicate":0.1}
+//	PUT  /chaos            replace toggles, e.g. {"drop":0.02,"delay":50000000,"duplicate":0.1,"partial":0.5}
 //	POST /price            {"symbol":"INFY","price":160000}  move a price (any distance)
 //	POST /drop             close the current order session now
 //	GET  /fills, /orders   the exchange's own records

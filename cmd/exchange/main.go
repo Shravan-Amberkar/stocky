@@ -25,13 +25,14 @@ func main() {
 	dup := flag.Float64("duplicate", 0, "probability an outbound message is sent twice")
 	reorder := flag.Float64("reorder", 0, "probability an outbound message is overtaken by later ones")
 	reject := flag.Float64("reject", 0, "probability a new order is rejected")
+	partial := flag.Float64("partial", 0, "probability a fill covers only part of the order")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	ex := exchange.New(map[string]int64{ // paise
 		"RELIANCE": 290000, "INFY": 160000, "TCS": 410000, "HDFCBANK": 170000, "SBIN": 80000,
 	}, log)
-	ex.SetChaos(exchange.Chaos{Drop: *drop, Delay: *delay, Duplicate: *dup, Reorder: *reorder, Reject: *reject})
+	ex.SetChaos(exchange.Chaos{Drop: *drop, Delay: *delay, Duplicate: *dup, Reorder: *reorder, Reject: *reject, Partial: *partial})
 
 	lo, err := net.Listen("tcp", *orders)
 	must(err)

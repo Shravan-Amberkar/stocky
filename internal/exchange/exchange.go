@@ -28,6 +28,7 @@ type Chaos struct {
 	Duplicate   float64                  `json:"duplicate"`    // send an outbound message twice
 	Reorder     float64                  `json:"reorder"`      // hold an outbound message back so later ones overtake it
 	Reject      float64                  `json:"reject"`       // reject a NEW order
+	Partial     float64                  `json:"partial"`      // fill only part of an order; the rest rests and fills on later ticks
 	SymbolDelay map[string]time.Duration `json:"symbol_delay"` // fixed extra latency for every message about one symbol
 }
 
@@ -41,9 +42,11 @@ const (
 )
 
 type order struct {
-	m     wire.Msg
-	state orderState
-	fills []wire.Msg
+	m         wire.Msg
+	state     orderState
+	remaining int64
+	fills     []wire.Msg
+	owner     *session // the session that last spoke about this order; its fills go there
 }
 
 // FillRecord is the exchange's own ledger: the ground truth a broker's positions must match.
@@ -210,6 +213,8 @@ func (e *Exchange) Simulate(interval time.Duration, gapProb float64, gapMax int,
 
 // ---------------------------------------------------------------- matching (caller holds e.mu)
 
+// match fills o if it is marketable. A market order always completes, possibly in several pieces;
+// a limit order may fill only partly (Chaos.Partial) and rest the remainder for later ticks.
 func (e *Exchange) match(o *order) {
 	px := e.prices[o.m.Symbol]
 	switch {
@@ -219,15 +224,29 @@ func (e *Exchange) match(o *order) {
 	default:
 		return // limit not marketable; rests
 	}
-	e.execSeq++
-	f := wire.Msg{Type: wire.Fill, ClientID: o.m.ClientID, Symbol: o.m.Symbol, Side: o.m.Side, Qty: o.m.Qty, Price: px,
-		ExecID: fmt.Sprintf("X%06d", e.execSeq)}
-	o.fills = append(o.fills, f)
-	o.state = stFilled
-	e.fills = append(e.fills, FillRecord{ClientID: o.m.ClientID, User: o.m.User, Symbol: o.m.Symbol, ExecID: f.ExecID,
-		Side: o.m.Side, Qty: o.m.Qty, Price: px})
-	if e.active != nil {
-		e.active.send(f)
+	for o.remaining > 0 {
+		qty := o.remaining
+		if qty > 1 && e.roll(e.chaos.Load().Partial) {
+			qty = 1 + rand.Int64N(qty-1)
+		}
+		e.execSeq++
+		f := wire.Msg{Type: wire.Fill, ClientID: o.m.ClientID, Symbol: o.m.Symbol, Side: o.m.Side, Qty: qty, Price: px,
+			ExecID: fmt.Sprintf("X%06d", e.execSeq)}
+		o.fills = append(o.fills, f)
+		o.remaining -= qty
+		e.fills = append(e.fills, FillRecord{ClientID: o.m.ClientID, User: o.m.User, Symbol: o.m.Symbol, ExecID: f.ExecID,
+			Side: o.m.Side, Qty: qty, Price: px})
+		if s := o.owner; s != nil && !s.closed.Load() {
+			s.send(f)
+		} else if e.active != nil {
+			e.active.send(f)
+		}
+		if o.m.OrdType == wire.Limit {
+			break // a part-filled limit rests; later ticks fill the rest
+		}
+	}
+	if o.remaining == 0 {
+		o.state = stFilled
 	}
 }
 
@@ -243,7 +262,7 @@ func (e *Exchange) replay(s *session, o *order) {
 		s.send(f)
 	}
 	if o.state == stCancelled {
-		s.send(wire.Msg{Type: wire.Cancelled, ClientID: o.m.ClientID, Symbol: o.m.Symbol})
+		s.send(wire.Msg{Type: wire.Cancelled, ClientID: o.m.ClientID, Symbol: o.m.Symbol, CumQty: o.m.Qty - o.remaining})
 	}
 }
 
@@ -253,10 +272,11 @@ func (e *Exchange) handle(s *session, m wire.Msg) {
 	switch m.Type {
 	case wire.New:
 		if o, ok := e.orders[m.ClientID]; ok {
+			o.owner = s
 			e.replay(s, o)
 			return
 		}
-		o := &order{m: m, state: stOpen}
+		o := &order{m: m, state: stOpen, remaining: m.Qty, owner: s}
 		e.orders[m.ClientID] = o
 		_, known := e.prices[m.Symbol]
 		switch {
@@ -272,14 +292,17 @@ func (e *Exchange) handle(s *session, m wire.Msg) {
 		}
 	case wire.Cancel:
 		o, ok := e.orders[m.ClientID]
+		if ok {
+			o.owner = s
+		}
 		switch {
 		case !ok:
 			s.send(wire.Msg{Type: wire.CancelReject, ClientID: m.ClientID, Symbol: m.Symbol, Reason: "unknown order"})
 		case o.state == stOpen:
 			o.state = stCancelled
-			s.send(wire.Msg{Type: wire.Cancelled, ClientID: m.ClientID, Symbol: o.m.Symbol})
+			s.send(wire.Msg{Type: wire.Cancelled, ClientID: m.ClientID, Symbol: o.m.Symbol, CumQty: o.m.Qty - o.remaining})
 		case o.state == stCancelled:
-			s.send(wire.Msg{Type: wire.Cancelled, ClientID: m.ClientID, Symbol: o.m.Symbol})
+			s.send(wire.Msg{Type: wire.Cancelled, ClientID: m.ClientID, Symbol: o.m.Symbol, CumQty: o.m.Qty - o.remaining})
 		default:
 			s.send(wire.Msg{Type: wire.CancelReject, ClientID: m.ClientID, Symbol: o.m.Symbol, Reason: "already " + string(o.state)})
 		}
