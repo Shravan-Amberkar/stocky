@@ -2,6 +2,7 @@
 package api
 
 import (
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -12,10 +13,14 @@ import (
 )
 
 type API struct {
-	Engine *engine.Engine
-	Risk   *rms.Gateway
-	WS     http.Handler
+	Engine        *engine.Engine
+	Risk          *rms.Gateway
+	WS            http.Handler
+	ExchangeAdmin string // shown to the demo console so it can drive the mock exchange
 }
+
+//go:embed console.html
+var console []byte
 
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -24,6 +29,16 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /strategies/{id}", a.get)
 	mux.HandleFunc("DELETE /strategies/{id}", a.cancel)
 	mux.HandleFunc("GET /accounts/{user}", a.account)
+	mux.HandleFunc("GET /accounts", func(w http.ResponseWriter, _ *http.Request) { write(w, http.StatusOK, a.Risk.Accounts()) })
+	mux.HandleFunc("GET /prices", func(w http.ResponseWriter, _ *http.Request) { write(w, http.StatusOK, a.Engine.Prices()) })
+	mux.HandleFunc("GET /console/config", func(w http.ResponseWriter, _ *http.Request) {
+		write(w, http.StatusOK, map[string]string{"exchange_admin": a.ExchangeAdmin})
+	})
+	// Optional demo console (not part of the brief): a read/drive view over the API above.
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(console) //nolint:errcheck
+	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) }) //nolint:errcheck
 	if a.WS != nil {
 		mux.Handle("GET /ws", a.WS)

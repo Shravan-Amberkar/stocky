@@ -50,6 +50,8 @@ type Engine struct {
 
 	mu    sync.RWMutex
 	snaps map[string]strategy.Strategy // read model for the API, written by actors
+
+	prices sync.Map // symbol -> last price, for display only
 }
 
 func New(symbols []string, pub Publisher, log *slog.Logger) *Engine {
@@ -80,8 +82,22 @@ func (e *Engine) Stop() {
 // OnTick and Deliver are called by the feed and the RMS. Both return immediately.
 func (e *Engine) OnTick(symbol string, px int64) {
 	if a := e.actors[symbol]; a != nil {
+		e.prices.Store(symbol, px)
 		a.mb.put(tick{px})
 	}
+}
+
+// Prices returns the last price seen per symbol (display only; actors keep their own).
+func (e *Engine) Prices() map[string]int64 {
+	out := map[string]int64{}
+	for s := range e.actors {
+		if v, ok := e.prices.Load(s); ok {
+			out[s] = v.(int64)
+		} else {
+			out[s] = 0
+		}
+	}
+	return out
 }
 
 func (e *Engine) Deliver(x rms.Execution) {

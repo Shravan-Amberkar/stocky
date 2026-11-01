@@ -21,6 +21,11 @@ Go 1.26, standard library plus one dependency (`github.com/coder/websocket`). Ev
 
 ## Run
 
+**Demo console**: `./scripts/run.sh`, then open http://127.0.0.1:8111/. It is a small page served by
+Stocky (optional, not part of the brief) showing live prices with buttons to move and gap them,
+switches for every exchange misbehaviour, a create-strategy form, the strategy table, the margin
+bar, Stocky's positions checked against the exchange's fills, and the user's live WebSocket stream.
+
 **Guided demo** (needs `curl` and `jq`): `./scripts/demo.sh` builds both binaries, starts them, and
 walks through every rule with real HTTP calls, real TCP and a live WebSocket stream: a gap entry,
 target vs stoploss under duplicated and delayed messages, an RMS margin refusal, a fill lost in a

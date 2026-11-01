@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stocky Console</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --ink:#15181d; --mute:#667085; --line:#e3e6eb; --accent:#2f5bea;
+          --up:#0f8a5f; --down:#c4314b; --warn:#b54708; --soft:#eef2ff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0e1014; --card:#161a21; --ink:#e8eaee; --mute:#98a2b3;
+          --line:#272c36; --accent:#7c9cff; --up:#3ccf91; --down:#ff6b81; --warn:#f5a524; --soft:#1c2333; } }
+  * { box-sizing:border-box } body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui,sans-serif }
+  header { display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:12px 16px; border-bottom:1px solid var(--line); background:var(--card) }
+  h1 { font-size:16px; margin:0 } h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--mute); margin:0 0 10px }
+  .pill { font-size:12px; padding:2px 9px; border-radius:99px; border:1px solid var(--line) } .ok { color:var(--up) } .bad { color:var(--down) }
+  main { display:grid; gap:12px; padding:12px 16px; grid-template-columns: repeat(12, 1fr) }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; min-width:0 }
+  .c4 { grid-column: span 4 } .c5 { grid-column: span 5 } .c7 { grid-column: span 7 } .c8 { grid-column: span 8 } .c12 { grid-column: span 12 }
+  @media (max-width: 1000px) { .c4,.c5,.c7,.c8 { grid-column: span 12 } }
+  button, select, input { font:inherit; color:inherit; background:var(--card); border:1px solid var(--line); border-radius:6px; padding:5px 8px }
+  button { cursor:pointer } button.primary { background:var(--accent); border-color:var(--accent); color:#fff } button:hover { border-color:var(--accent) }
+  .syms { display:grid; grid-template-columns: repeat(auto-fill, minmax(150px,1fr)); gap:8px }
+  .sym { border:1px solid var(--line); border-radius:8px; padding:8px } .sym .p { font-size:18px; font-weight:600; font-variant-numeric:tabular-nums }
+  .sym .row { display:flex; gap:4px; margin-top:6px } .sym button { flex:1; padding:3px 0; font-size:12px }
+  .flash-up { color:var(--up) } .flash-down { color:var(--down) }
+  .chaos label { display:flex; align-items:center; gap:8px; padding:3px 0 } .chaos small { color:var(--mute) }
+  form.new { display:grid; grid-template-columns: repeat(4, 1fr); gap:8px } form.new label { display:flex; flex-direction:column; font-size:12px; color:var(--mute); gap:3px }
+  form.new .full { grid-column: span 4 } @media (max-width:600px) { form.new { grid-template-columns: repeat(2,1fr) } form.new .full { grid-column: span 2 } }
+  .bar { height:14px; border-radius:7px; background:var(--soft); overflow:hidden; display:flex; margin:6px 0 }
+  .bar .u { background:var(--accent) } .bar .r { background:var(--warn) }
+  table { width:100%; border-collapse:collapse; font-size:13px } th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap }
+  th { color:var(--mute); font-weight:500 } td.num { font-variant-numeric:tabular-nums } .scroll { overflow:auto; max-height:340px }
+  .badge { font-size:11px; font-weight:600; padding:2px 7px; border-radius:99px; border:1px solid currentColor }
+  .WAITING_ENTRY { color:var(--mute) } .ENTRY_PENDING, .EXIT_PENDING { color:var(--warn) } .OPEN { color:var(--accent) }
+  .CLOSED { color:var(--up) } .CANCELLED { color:var(--mute) } .REJECTED { color:var(--down) }
+  .feed { font:12px ui-monospace,monospace; max-height:300px; overflow:auto } .feed div { padding:3px 0; border-bottom:1px dashed var(--line) }
+  .muted { color:var(--mute) } .err { color:var(--down); font-size:12px; min-height:16px }
+</style>
+</head>
+<body>
+<header>
+  <h1>Stocky console</h1>
+  <span class="muted">a viewer over the API, for demos. The API is the product</span>
+  <span style="flex:1"></span>
+  <label>user <select id="user"></select></label>
+  <span id="ws" class="pill">stream: connecting</span>
+</header>
+<main>
+  <section class="card c8"><h2>Market (mock exchange)</h2><div class="syms" id="syms"></div>
+    <p class="muted" style="margin:8px 0 0">"gap" moves the price several levels in one tick.</p></section>
+
+  <section class="card c4 chaos"><h2>Exchange misbehaviour</h2>
+    <label><input type="checkbox" data-k="duplicate" data-v="1"> duplicate every message</label>
+    <label><input type="checkbox" data-k="delay" data-v="300000000"> delay messages (up to 300 ms)</label>
+    <label><input type="checkbox" data-k="reorder" data-v="0.5"> reorder messages</label>
+    <label><input type="checkbox" data-k="reject" data-v="0.3"> reject 30% of orders</label>
+    <label><input type="checkbox" data-k="drop" data-v="0.05"> drop connection randomly (5%)</label>
+    <div style="display:flex;gap:8px;margin-top:8px"><button id="cut">Cut connection now</button><button id="calm">All off</button></div>
+    <small>The rules must hold whatever is switched on.</small></section>
+
+  <section class="card c7"><h2>New strategy</h2>
+    <form class="new" id="form">
+      <label>symbol <select name="symbol"></select></label>
+      <label>side <select name="side"><option>LONG</option><option>SHORT</option></select></label>
+      <label>entry <select name="entry"><option>MARKET</option><option>LIMIT</option></select></label>
+      <label>qty <input name="qty" type="number" min="1" value="10"></label>
+      <label>trigger ₹ <input name="trigger" type="number" step="0.05"></label>
+      <label>limit ₹ <input name="limit" type="number" step="0.05" placeholder="LIMIT only"></label>
+      <label>target ₹ <input name="target" type="number" step="0.05" placeholder="optional"></label>
+      <label>stoploss ₹ <input name="stoploss" type="number" step="0.05" placeholder="optional"></label>
+      <div class="full" style="display:flex;gap:8px;align-items:center">
+        <button class="primary">Create</button>
+        <button type="button" id="fill">Fill from current price</button>
+        <span class="err" id="ferr"></span></div>
+    </form></section>
+
+  <section class="card c5"><h2>Account</h2><div id="acct"></div></section>
+
+  <section class="card c12"><h2>Strategies</h2><div class="scroll"><table>
+    <thead><tr><th>id</th><th>symbol</th><th>side</th><th>qty</th><th>trigger</th><th>target</th><th>stoploss</th><th>state</th><th>entry</th><th>exit</th><th>note</th><th></th></tr></thead>
+    <tbody id="strats"></tbody></table></div></section>
+
+  <section class="card c7"><h2>Live stream (WebSocket, this user)</h2><div class="feed" id="feed"><div class="muted">Events appear here as they happen (from when this page opened). Move a price to trigger something.</div></div></section>
+  <section class="card c5"><h2>Exchange fills (the exchange's own record)</h2><div class="scroll"><table>
+    <thead><tr><th>order</th><th>side</th><th>qty</th><th>price</th></tr></thead><tbody id="fills"></tbody></table></div></section>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const rs = p => p ? "₹" + (p / 100).toLocaleString("en-IN", {minimumFractionDigits: 2}) : "—";
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let ADMIN = "", prices = {}, prevPrices = {}, user = "u1", ws;
+
+async function j(url, opt) { const r = await fetch(url, opt); const b = await r.json().catch(() => ({})); if (!r.ok) throw new Error(b.error || r.status); return b; }
+
+async function boot() {
+  ADMIN = (await j("/console/config")).exchange_admin;
+  const accts = await j("/accounts");
+  $("#user").innerHTML = Object.keys(accts).sort().map(u => `<option>${u}</option>`).join("");
+  $("#user").value = user;
+  $("#user").onchange = e => { user = e.target.value; $("#feed").innerHTML = ""; connect(); refresh(); };
+  connect(); refresh(); setInterval(refresh, 700);
+}
+
+function connect() {
+  if (ws) ws.close();
+  ws = new WebSocket(`ws://${location.host}/ws?user=${encodeURIComponent(user)}`);
+  ws.onopen = () => { $("#ws").textContent = "stream: live"; $("#ws").className = "pill ok"; };
+  ws.onclose = () => { $("#ws").textContent = "stream: closed"; $("#ws").className = "pill bad"; };
+  ws.onmessage = ev => {
+    const e = JSON.parse(ev.data), t = new Date().toLocaleTimeString();
+    const line = e.type === "order"
+      ? `order  ${e.order.client_id}  ${e.order.kind}${e.order.qty ? `  ${e.order.side} ${e.order.qty} @ ${rs(e.order.price)}` : ""}${e.order.reason ? "  (" + e.order.reason + ")" : ""}`
+      : `strategy  ${e.strategy.id}  → ${e.strategy.state}${e.strategy.exit_reason ? " (" + e.strategy.exit_reason + ")" : ""}`;
+    const d = document.createElement("div"); d.innerHTML = `<span class="muted">${t}</span>  ${esc(line)}`;
+    $("#feed").prepend(d); while ($("#feed").children.length > 200) $("#feed").lastChild.remove();
+    refresh();
+  };
+}
+
+async function refresh() {
+  try {
+    prevPrices = prices; prices = await j("/prices");
+    renderSyms();
+    const [strats, acct, fills] = await Promise.all([j(`/strategies?user=${user}`), j(`/accounts/${user}`), j(`${ADMIN}/fills`).catch(() => [])]);
+    renderStrats(strats); renderAccount(acct, fills || []); renderFills(fills || []);
+  } catch (e) { $("#ws").textContent = "stocky unreachable"; $("#ws").className = "pill bad"; }
+}
+
+function renderSyms() {
+  const syms = Object.keys(prices).sort();
+  const f = $("#form [name=symbol]");
+  if (f.options.length !== syms.length) f.innerHTML = syms.map(s => `<option>${s}</option>`).join("");
+  $("#syms").innerHTML = syms.map(s => {
+    const cls = prices[s] > (prevPrices[s] || 0) && prevPrices[s] ? "flash-up" : prices[s] < prevPrices[s] ? "flash-down" : "";
+    return `<div class="sym"><div class="muted">${s}</div><div class="p ${cls}">${rs(prices[s])}</div>
+      <div class="row"><button onclick="move('${s}',-0.03)" title="gap down 3%">gap ▼</button><button onclick="move('${s}',-0.005)">▼</button>
+      <button onclick="move('${s}',0.005)">▲</button><button onclick="move('${s}',0.03)" title="gap up 3%">gap ▲</button></div></div>`;
+  }).join("");
+}
+
+async function move(sym, pct) {
+  const p = Math.max(5, Math.round(prices[sym] * (1 + pct) / 5) * 5);
+  await j(`${ADMIN}/price`, {method: "POST", body: JSON.stringify({symbol: sym, price: p})});
+  refresh();
+}
+
+function renderAccount(a, fills) {
+  const free = Math.max(0, a.limit - a.used - a.reserved), pct = v => a.limit ? (100 * v / a.limit) : 0;
+  const ex = {};
+  fills.filter(f => f.User === user).forEach(f => ex[f.Symbol] = (ex[f.Symbol] || 0) + (f.Side === "BUY" ? f.Qty : -f.Qty));
+  const syms = [...new Set([...Object.keys(a.positions || {}), ...Object.keys(ex)])].sort();
+  const rows = syms.map(s => { const mine = (a.positions || {})[s] || 0, theirs = ex[s] || 0;
+    return `<tr><td>${s}</td><td class="num">${mine}</td><td class="num">${theirs}</td><td class="${mine === theirs ? "ok" : "bad"}">${mine === theirs ? "✓ match" : "✗ MISMATCH"}</td></tr>`; }).join("");
+  $("#acct").innerHTML = `
+    <div style="display:flex;justify-content:space-between"><b>Margin ${rs(a.limit)}</b><span class="muted">free ${rs(free)}</span></div>
+    <div class="bar"><div class="u" style="width:${pct(a.used)}%"></div><div class="r" style="width:${pct(a.reserved)}%"></div></div>
+    <div class="muted" style="font-size:12px">■ <span style="color:var(--accent)">used ${rs(a.used)}</span> &nbsp; ■ <span style="color:var(--warn)">reserved for working orders ${rs(a.reserved)}</span></div>
+    <h2 style="margin-top:14px">Positions: Stocky vs exchange</h2>
+    <table><thead><tr><th>symbol</th><th>Stocky</th><th>exchange fills</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="4" class="muted">no positions</td></tr>`}</tbody></table>`;
+}
+
+function renderStrats(list) {
+  $("#strats").innerHTML = list.slice().reverse().map(s => {
+    const sp = s.spec, live = !["CLOSED","CANCELLED","REJECTED","EXIT_PENDING"].includes(s.state);
+    return `<tr><td class="muted">${esc(s.id.split("-").pop())}</td><td>${sp.symbol}</td><td>${sp.side}</td><td class="num">${sp.qty}</td>
+      <td class="num">${rs(sp.trigger)}${sp.entry === "LIMIT" ? " / lim " + rs(sp.limit) : ""}</td><td class="num">${rs(sp.target)}</td><td class="num">${rs(sp.stoploss)}</td>
+      <td><span class="badge ${s.state}">${s.state}</span></td><td class="num">${s.entry_price ? rs(s.entry_price) : ""}</td>
+      <td>${s.exit_reason ? esc(s.exit_reason) + " @ " + rs(s.exit_price) : ""}</td><td class="muted">${esc(s.note)}</td>
+      <td>${live ? `<button onclick="cancelS('${s.id}')">cancel</button>` : ""}</td></tr>`;
+  }).join("") || `<tr><td colspan="12" class="muted">No strategies yet. Create one above.</td></tr>`;
+}
+
+function renderFills(fills) {
+  $("#fills").innerHTML = fills.filter(f => f.User === user).reverse().map(f =>
+    `<tr><td class="muted">${esc(f.ClientID.split("-").slice(-2).join("-"))}</td><td>${f.Side}</td><td class="num">${f.Qty}</td><td class="num">${rs(f.Price)}</td></tr>`).join("")
+    || `<tr><td colspan="4" class="muted">none yet</td></tr>`;
+}
+
+async function cancelS(id) { try { await j(`/strategies/${id}`, {method: "DELETE"}); } catch (e) { alert(e.message); } refresh(); }
+
+$("#fill").onclick = () => {
+  const f = $("#form"), sym = f.symbol.value, p = prices[sym] / 100, long = f.side.value === "LONG", r = x => (Math.round(x * 20) / 20).toFixed(2);
+  f.trigger.value = r(p * (long ? 1.002 : 0.998)); f.limit.value = f.entry.value === "LIMIT" ? r(p * (long ? 1.004 : 0.996)) : "";
+  f.target.value = r(p * (long ? 1.02 : 0.98)); f.stoploss.value = r(p * (long ? 0.99 : 1.01));
+};
+
+$("#form").onsubmit = async e => {
+  e.preventDefault(); const f = e.target, paise = v => v === "" ? 0 : Math.round(parseFloat(v) * 100);
+  const body = {user, symbol: f.symbol.value, side: f.side.value, entry: f.entry.value, qty: parseInt(f.qty.value, 10),
+    trigger: paise(f.trigger.value), target: paise(f.target.value), stoploss: paise(f.stoploss.value)};
+  if (f.entry.value === "LIMIT") body.limit = paise(f.limit.value);
+  try { await j("/strategies", {method: "POST", body: JSON.stringify(body)}); $("#ferr").textContent = ""; }
+  catch (err) { $("#ferr").textContent = err.message; }
+  refresh();
+};
+
+async function setChaos() {
+  const c = {};
+  document.querySelectorAll(".chaos input:checked").forEach(i => c[i.dataset.k] = parseFloat(i.dataset.v));
+  await j(`${ADMIN}/chaos`, {method: "PUT", body: JSON.stringify(c)});
+}
+document.querySelectorAll(".chaos input").forEach(i => i.onchange = setChaos);
+$("#calm").onclick = () => { document.querySelectorAll(".chaos input").forEach(i => i.checked = false); setChaos(); };
+$("#cut").onclick = () => j(`${ADMIN}/drop`, {method: "POST"});
+boot();
+</script>
+</body>
+</html>

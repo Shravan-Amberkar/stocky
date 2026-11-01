@@ -43,5 +43,15 @@ func (e *Exchange) AdminHandler() http.Handler {
 	mux.HandleFunc("POST /drop", func(w http.ResponseWriter, _ *http.Request) { e.DropActive(); j(w, "dropped") })
 	mux.HandleFunc("GET /fills", func(w http.ResponseWriter, _ *http.Request) { j(w, e.Fills()) })
 	mux.HandleFunc("GET /orders", func(w http.ResponseWriter, _ *http.Request) { j(w, e.Orders()) })
-	return mux
+	// Local dev tool: allow the Stocky demo console (another origin) to drive it.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }

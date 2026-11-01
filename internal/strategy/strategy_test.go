@@ -167,3 +167,17 @@ func TestValidation(t *testing.T) {
 		t.Fatal("no price yet")
 	}
 }
+
+func TestDeniedExitIsNotStranded(t *testing.T) {
+	s := longWithExits(t)
+	open(t, s, 10_000)
+	s.OnTick(12_500)
+	s.OrderPlaced("X2", false)
+	s.OrderDenied(false, "simulated")
+	if s.State != Open || s.ExitOrder != "" {
+		t.Fatalf("denied exit must re-arm, got %s", s.State)
+	}
+	if in := s.OnTick(12_600); len(in) != 1 {
+		t.Fatal("next tick should retry the exit")
+	}
+}

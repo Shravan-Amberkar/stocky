@@ -218,9 +218,10 @@ func (s *Strategy) OrderDenied(entry bool, reason string) {
 		s.State, s.Note = Rejected, "entry denied by RMS: "+reason
 		return
 	}
-	// An exit can only be denied if the RMS believes one is already working or done; stay pending
-	// and let that exit's outcome decide.
-	s.Note = "exit denied by RMS: " + reason
+	// The RMS only refuses an exit it believes is already working or done, which the state machine
+	// should never produce. Never strand the strategy in EXIT_PENDING: go back to OPEN, so the next
+	// tick re-evaluates and retries.
+	s.State, s.ExitOrder, s.Note = Open, "", "exit denied by RMS: "+reason+"; re-armed"
 }
 
 // OnExecution applies a validated exchange event for one of this strategy's orders.

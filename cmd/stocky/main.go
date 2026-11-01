@@ -19,6 +19,7 @@ func main() {
 	httpAddr := flag.String("http", "127.0.0.1:8080", "API + WebSocket listen address")
 	orders := flag.String("exchange", "127.0.0.1:9001", "exchange order port")
 	md := flag.String("md", "127.0.0.1:9002", "exchange market data port")
+	admin := flag.String("exchange-admin", "http://127.0.0.1:9003", "mock exchange admin URL (used by the demo console)")
 	symbols := flag.String("symbols", "RELIANCE,INFY,TCS,HDFCBANK,SBIN", "tradable symbols")
 	users := flag.String("users", "u1=100000000,u2=50000000,u3=20000000", "user=margin in paise")
 	flag.Parse()
@@ -41,7 +42,7 @@ func main() {
 	eng.Start(gw)
 	go engine.Feed(*md, eng, log, nil)
 
-	a := &api.API{Engine: eng, Risk: gw, WS: hub}
+	a := &api.API{Engine: eng, Risk: gw, WS: hub, ExchangeAdmin: *admin}
 	log.Info("stocky up", "http", *httpAddr, "exchange", *orders, "md", *md)
 	if err := http.ListenAndServe(*httpAddr, a.Handler()); err != nil {
 		log.Error("http", "err", err)
